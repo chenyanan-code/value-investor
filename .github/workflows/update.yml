@@ -1,6 +1,9 @@
 name: Update market data
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
     - cron: '20 1 * * 1-5'
 permissions:

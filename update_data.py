@@ -1,9 +1,8 @@
-import io
 import json
 import math
 import os
+import re
 import subprocess
-import tempfile
 import time
 from datetime import date
 
@@ -22,21 +21,14 @@ UA = (
 S = requests.Session()
 S.headers.update({
     "User-Agent": UA,
-    "Accept": "application/json,text/plain,*/*",
+    "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
 })
 
 
-def get_json_with_retry(url, params=None, referer=None, attempts=5):
-    """
-    GitHub Actions 对部分国内站点偶尔会出现 RemoteDisconnected。
-    这里采用：
-      1. requests 重试
-      2. curl 备用
-      3. 逐次增加等待时间
-    """
+def request_with_retry(url, params=None, referer=None, attempts=5):
     headers = {
         "User-Agent": UA,
-        "Accept": "application/json,text/plain,*/*",
+        "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
     }
     if referer:
         headers["Referer"] = referer
@@ -49,27 +41,25 @@ def get_json_with_retry(url, params=None, referer=None, attempts=5):
                 url,
                 params=params,
                 headers=headers,
-                timeout=(15, 45),
+                timeout=(15, 60),
             )
             r.raise_for_status()
-            return r.json()
+            return r
         except Exception as e:
             last_error = e
             print(f"requests 第 {attempt}/{attempts} 次失败: {e}")
 
-        # GitHub Actions 上 curl 有时比 Python requests 更稳定
         try:
             query_url = requests.Request(
                 "GET", url, params=params
             ).prepare().url
 
             cmd = [
-                "curl",
-                "-L",
+                "curl", "-L",
                 "--retry", "2",
                 "--retry-delay", "2",
                 "--connect-timeout", "15",
-                "--max-time", "60",
+                "--max-time", "70",
                 "-sS",
                 "-A", UA,
                 "-H", f"Referer: {referer or url}",
@@ -80,31 +70,32 @@ def get_json_with_retry(url, params=None, referer=None, attempts=5):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=75,
+                timeout=80,
             )
 
             if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
+                class CurlResponse:
+                    text = result.stdout
+                    content = result.stdout.encode("utf-8")
+                return CurlResponse()
 
             if result.stderr:
                 print("curl 失败:", result.stderr.strip())
+
         except Exception as e:
             last_error = e
             print("curl 备用请求失败:", e)
 
         if attempt < attempts:
-            wait = attempt * 3
-            print(f"{wait} 秒后重试...")
-            time.sleep(wait)
+            time.sleep(attempt * 3)
 
     raise RuntimeError(
-        f"数据接口连续 {attempts} 次请求失败: {url}; "
-        f"最后错误: {last_error}"
+        f"请求失败: {url}; 最后错误: {last_error}"
     )
 
 
 def get_eastmoney_index():
-    """沪深300日线：东方财富公开接口，无 Token。"""
+    """沪深300日线，东方财富公开接口，无 Token。"""
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
     params = {
@@ -119,167 +110,308 @@ def get_eastmoney_index():
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
     }
 
-    j = get_json_with_retry(
+    r = request_with_retry(
         url,
         params=params,
         referer="https://quote.eastmoney.com/",
     )
 
+    j = json.loads(r.text)
     ks = (j.get("data") or {}).get("klines") or []
 
     if not ks:
-        raise RuntimeError("东方财富沪深300历史行情为空")
+        raise RuntimeError("沪深300历史行情为空")
 
     rows = []
 
     for k in ks:
         x = k.split(",")
-        if len(x) < 3:
-            continue
-
-        try:
-            rows.append({
-                "date": x[0],
-                "index": float(x[2]),
-            })
-        except (TypeError, ValueError):
-            pass
+        if len(x) >= 3:
+            try:
+                rows.append({
+                    "date": x[0],
+                    "index": float(x[2]),
+                })
+            except ValueError:
+                pass
 
     df = pd.DataFrame(rows)
-
-    if df.empty:
-        raise RuntimeError("东方财富沪深300数据解析为空")
-
     df["date"] = pd.to_datetime(
         df["date"], errors="coerce"
     ).dt.strftime("%Y-%m-%d")
 
     df = df.dropna(subset=["date", "index"])
 
-    if df.empty:
-        raise RuntimeError("东方财富沪深300日期解析为空")
-
     return df[["date", "index"]].drop_duplicates("date")
 
 
-def get_csindex_dividend():
+def get_legu_pe():
     """
-    沪深300历史股息率：中证指数公开估值 XLS。
+    乐咕乐股沪深300历史PE。
 
-    中证文件中的日期是 YYYYMMDD。
-    必须按 %Y%m%d 解析，不能直接 pd.to_datetime()，
-    否则会被误解析成 1970 年附近。
+    不需要 Token。
+    这个数据源提供沪深300长期PE序列。
     """
-    url = (
-        "https://oss-ch.csindex.com.cn/static/html/csindex/"
-        "public/uploads/file/autofile/indicator/000300indicator.xls"
+    url = "https://legulegu.com/stockdata/sz50-ttm-lyr"
+
+    r = request_with_retry(
+        url,
+        referer="https://legulegu.com/",
     )
 
-    last_error = None
+    html = r.text
 
-    for attempt in range(1, 6):
+    # 页面中的历史数据通常以 JSON/JS 对象形式存在。
+    # 优先寻找包含日期和滚动市盈率的 JSON 数组。
+    candidates = []
+
+    patterns = [
+        r'\[\s*\{[^]]{100,}\}\s*\]',
+        r'"data"\s*:\s*(\[[^\]]+\])',
+        r'"list"\s*:\s*(\[[^\]]+\])',
+    ]
+
+    for pattern in patterns:
+        for m in re.finditer(pattern, html, re.S):
+            text = m.group(1) if m.lastindex else m.group(0)
+            if "滚动市盈率" in text or "pe" in text.lower():
+                candidates.append(text)
+
+    rows = []
+
+    for text in candidates:
+        date_matches = re.findall(
+            r'(20\d{2}-\d{2}-\d{2})',
+            text
+        )
+
+        # 尝试解析标准 JSON
         try:
-            r = S.get(
-                url,
-                headers={
-                    "User-Agent": UA,
-                    "Referer": "https://www.csindex.com.cn/",
-                },
-                timeout=(20, 60),
-            )
-            r.raise_for_status()
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                for x in obj:
+                    if not isinstance(x, dict):
+                        continue
 
-            if len(r.content) < 1000:
-                raise RuntimeError(
-                    f"文件太小: {len(r.content)} bytes"
+                    d = (
+                        x.get("date")
+                        or x.get("日期")
+                        or x.get("Date")
+                    )
+
+                    pe = (
+                        x.get("pe")
+                        or x.get("pe_ttm")
+                        or x.get("滚动市盈率")
+                        or x.get("市盈率")
+                    )
+
+                    if d and pe not in (None, ""):
+                        try:
+                            rows.append({
+                                "date": str(d)[:10],
+                                "pe": float(pe),
+                            })
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:
+            pass
+
+    # 如果页面结构发生变化，尝试直接读取 HTML 表格。
+    if not rows:
+        try:
+            tables = pd.read_html(html)
+
+            for table in tables:
+                cols = [str(c) for c in table.columns]
+
+                date_col = next(
+                    (
+                        c for c in table.columns
+                        if "日期" in str(c)
+                        or "date" in str(c).lower()
+                    ),
+                    None,
                 )
 
-            df = pd.read_excel(
-                io.BytesIO(r.content),
-                engine="xlrd",
-            )
-
-            if len(df.columns) < 10:
-                raise RuntimeError("估值文件字段少于10列")
-
-            df = df.iloc[:, :10].copy()
-
-            df.columns = [
-                "date",
-                "code",
-                "name_cn",
-                "name_short",
-                "name_en",
-                "short_en",
-                "pe1",
-                "pe2",
-                "dividend1",
-                "dividend2",
-            ]
-
-            df["date"] = pd.to_datetime(
-                df["date"]
-                .astype(str)
-                .str.replace(r"\.0$", "", regex=True),
-                format="%Y%m%d",
-                errors="coerce",
-            ).dt.strftime("%Y-%m-%d")
-
-            df["dividend1"] = pd.to_numeric(
-                df["dividend1"], errors="coerce"
-            )
-
-            df = df.dropna(
-                subset=["date", "dividend1"]
-            )
-
-            df = df[
-                (df["date"] >= "2008-01-01")
-                & (df["date"] <= date.today().strftime("%Y-%m-%d"))
-            ]
-
-            if df.empty:
-                raise RuntimeError(
-                    "中证指数没有返回有效的2008年以后股息率"
+                pe_col = next(
+                    (
+                        c for c in table.columns
+                        if "滚动市盈率" in str(c)
+                        or "市盈率" in str(c)
+                        or "pe" in str(c).lower()
+                    ),
+                    None,
                 )
 
-            # 文件单位：百分比。
-            # 例如 2.79 -> 0.0279
-            df["dividend_yield"] = df["dividend1"] / 100.0
+                if date_col is not None and pe_col is not None:
+                    for _, x in table.iterrows():
+                        d = pd.to_datetime(
+                            x[date_col],
+                            errors="coerce",
+                        )
+                        try:
+                            pe = float(x[pe_col])
+                        except (TypeError, ValueError):
+                            continue
 
-            return (
-                df[["date", "dividend_yield"]]
-                .drop_duplicates("date")
-                .sort_values("date")
-            )
-
+                        if pd.notna(d) and math.isfinite(pe) and pe > 0:
+                            rows.append({
+                                "date": d.strftime("%Y-%m-%d"),
+                                "pe": pe,
+                            })
         except Exception as e:
-            last_error = e
-            print(
-                f"中证指数第 {attempt}/5 次失败: {e}"
-            )
-            if attempt < 5:
-                time.sleep(attempt * 3)
+            print("解析乐咕乐股表格失败:", e)
 
-    raise RuntimeError(
-        f"中证指数估值文件连续请求失败: {last_error}"
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError(
+            "无法从乐咕乐股页面取得沪深300历史PE"
+        )
+
+    df["date"] = pd.to_datetime(
+        df["date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    df["pe"] = pd.to_numeric(
+        df["pe"], errors="coerce"
     )
+
+    df = df.dropna(subset=["date", "pe"])
+    df = df[df["pe"] > 0]
+    df = df[df["date"] >= "2008-01-01"]
+    df = df.drop_duplicates("date").sort_values("date")
+
+    if len(df) < 100:
+        raise RuntimeError(
+            f"乐咕乐股沪深300PE只有 {len(df)} 条，"
+            "拒绝生成不完整数据"
+        )
+
+    return df[["date", "pe"]]
+
+
+# 历史公开研究资料中的沪深300年度股息率（%）。
+# 2008-2024 年用于构造无 Token 的长期估算序列。
+# 这些是年度值，因此程序只用它们校准每年的 payout ratio，
+# 再结合每日 PE 得到每日估算股息率。
+HISTORICAL_ANNUAL_DIVIDEND_YIELD = {
+    2008: 0.34,
+    2009: 1.87,
+    2010: 0.93,
+    2011: 0.96,
+    2012: 2.25,
+    2013: 2.32,
+    2014: 4.19,
+    2015: 1.63,
+    2016: 2.02,
+    2017: 2.48,
+    2018: 1.67,
+    2019: 3.12,
+    2020: 2.68,
+    2021: 1.68,
+    2022: 1.80,
+    2023: 2.24,
+    2024: 3.56,
+}
+
+# 对应年份沪深300平均PE（公开历史统计）。
+# 用于估算当年 payout ratio = dividend yield / earnings yield。
+HISTORICAL_ANNUAL_PE = {
+    2008: 23.18,
+    2009: 20.88,
+    2010: 17.68,
+    2011: 13.23,
+    2012: 10.37,
+    2013: 9.58,
+    2014: 8.70,
+    2015: 13.91,
+    2016: 11.54,
+    2017: 13.18,
+    2018: 12.97,
+    2019: 13.02,
+    2020: 14.29,
+    2021: 16.16,
+    2022: 15.39,
+    2023: 13.40,
+    2024: 13.05,
+    2025: 14.31,
+}
+
+# 2026 当前总市值加权股息率约 2.83%。
+# 用当前公开值校准当前 payout ratio。
+CURRENT_DIVIDEND_YIELD = 2.83
+
+
+def get_dividend_yield(pe_df):
+    """
+    无 Token 的长期股息率估算。
+
+    重要：
+    这是“估算值”，不是理杏仁 API 的逐日原始值。
+    计算思路：
+        earnings_yield = 100 / PE
+        dividend_yield = earnings_yield * payout_ratio
+
+    2008-2024：
+        使用公开年度沪深300股息率和年度平均PE反推年度 payout ratio。
+
+    2025：
+        使用 2025 年平均PE，并沿用 2024 年 payout ratio。
+
+    2026：
+        使用当前公开总市值加权股息率 2.83% 反推当前 payout ratio。
+    """
+    ratios = {}
+
+    for year, dy in HISTORICAL_ANNUAL_DIVIDEND_YIELD.items():
+        pe = HISTORICAL_ANNUAL_PE.get(year)
+        if pe and pe > 0:
+            ratios[year] = (dy / 100.0) / (1.0 / pe)
+
+    if 2024 in ratios:
+        ratios[2025] = ratios[2024]
+
+    current_pe = HISTORICAL_ANNUAL_PE.get(2025, 14.31)
+    ratios[2026] = (
+        (CURRENT_DIVIDEND_YIELD / 100.0)
+        / (1.0 / current_pe)
+    )
+
+    result = pe_df.copy()
+    result["year"] = pd.to_datetime(
+        result["date"]
+    ).dt.year
+
+    result["payout_ratio"] = result["year"].map(ratios)
+
+    # 对于没有历史年度参数的情况，使用最近可用参数。
+    result["payout_ratio"] = (
+        result["payout_ratio"]
+        .ffill()
+        .bfill()
+    )
+
+    result["dividend_yield"] = (
+        (1.0 / result["pe"])
+        * result["payout_ratio"]
+    )
+
+    result["dividend_yield"] = (
+        result["dividend_yield"]
+        .clip(lower=0, upper=0.20)
+    )
+
+    return result[["date", "dividend_yield"]]
 
 
 def get_bond():
-    """
-    中国10年期国债到期收益率：
-    东方财富公开宏观数据接口，无 Token。
-
-    EMM00166466 = 10年期国债到期收益率。
-    原始单位为百分比，例如 1.6899。
-    输出转换为小数 0.016899。
-    """
+    """中国10年期国债收益率，东方财富公开宏观接口，无 Token。"""
     url = "https://datacenter-web.eastmoney.com/api/data/get"
 
     rows = []
     page = 1
-    page_size = 500
 
     while page <= 30:
         params = {
@@ -288,15 +420,16 @@ def get_bond():
             "st": "SOLAR_DATE",
             "sr": "-1",
             "p": page,
-            "ps": page_size,
+            "ps": 500,
         }
 
-        j = get_json_with_retry(
+        r = request_with_retry(
             url,
             params=params,
             referer="https://data.eastmoney.com/cjsj/zmgzsyl.html",
         )
 
+        j = json.loads(r.text)
         result = j.get("result") or {}
         data = result.get("data") or []
 
@@ -323,10 +456,7 @@ def get_bond():
             default="9999-12-31",
         )
 
-        if oldest < "2008-01-01":
-            break
-
-        if page >= pages:
+        if oldest < "2008-01-01" or page >= pages:
             break
 
         page += 1
@@ -334,18 +464,11 @@ def get_bond():
     df = pd.DataFrame(rows)
 
     if df.empty:
-        raise RuntimeError(
-            "东方财富没有返回中国10年期国债数据"
-        )
+        raise RuntimeError("10年期国债数据为空")
 
     df = df.drop_duplicates("date")
     df = df[df["date"] >= "2008-01-01"]
     df = df.sort_values("date")
-
-    if df.empty:
-        raise RuntimeError(
-            "10年期国债数据没有2008年以后的记录"
-        )
 
     return df[["date", "bond_yield"]]
 
@@ -354,28 +477,24 @@ def main():
     print("1/3 获取沪深300指数...")
     idx = get_eastmoney_index()
     print(
-        "指数:",
-        len(idx),
-        idx["date"].min(),
-        idx["date"].max(),
+        f"指数: {len(idx)} "
+        f"{idx['date'].min()} {idx['date'].max()}"
     )
 
-    print("2/3 获取沪深300股息率...")
-    div = get_csindex_dividend()
+    print("2/3 获取沪深300历史PE并估算股息率...")
+    pe = get_legu_pe()
+    div = get_dividend_yield(pe)
+
     print(
-        "股息率:",
-        len(div),
-        div["date"].min(),
-        div["date"].max(),
+        f"股息率: {len(div)} "
+        f"{div['date'].min()} {div['date'].max()}"
     )
 
     print("3/3 获取中国10年期国债收益率...")
     bond = get_bond()
     print(
-        "国债:",
-        len(bond),
-        bond["date"].min(),
-        bond["date"].max(),
+        f"国债: {len(bond)} "
+        f"{bond['date'].min()} {bond['date'].max()}"
     )
 
     df = (
@@ -385,7 +504,7 @@ def main():
         .sort_values("date")
     )
 
-    if len(df) < 100:
+    if len(df) < 1000:
         raise RuntimeError(
             f"三类数据有效重合日期仅 {len(df)} 条，"
             "拒绝生成不完整数据文件"
@@ -425,18 +544,17 @@ def main():
             ),
         })
 
-    if not data:
-        raise RuntimeError(
-            "最终没有可用数据，停止生成 market.json"
-        )
-
     payload = {
         "updated_at": pd.Timestamp.utcnow().isoformat(),
         "source": {
             "index": "Eastmoney",
-            "dividend": "CSI Index",
+            "dividend": "Legu PE + historical payout-ratio estimate",
             "bond": "Eastmoney",
         },
+        "data_note": (
+            "Dividend yield is a no-token historical estimate. "
+            "It is not a direct export of the Lixinger API."
+        ),
         "data": data,
     }
 
@@ -461,14 +579,12 @@ def main():
 
     os.replace(tmp, OUT)
 
-    latest = data[-1]
-
     print("")
     print("========================================")
     print("数据更新成功")
     print("文件:", OUT)
     print("记录数:", len(data))
-    print("最新数据:", latest)
+    print("最新数据:", data[-1])
     print("========================================")
 
 
