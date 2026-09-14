@@ -2,6 +2,9 @@ import io
 import json
 import math
 import os
+import subprocess
+import tempfile
+import time
 from datetime import date
 
 import pandas as pd
@@ -23,9 +26,87 @@ S.headers.update({
 })
 
 
+def get_json_with_retry(url, params=None, referer=None, attempts=5):
+    """
+    GitHub Actions 对部分国内站点偶尔会出现 RemoteDisconnected。
+    这里采用：
+      1. requests 重试
+      2. curl 备用
+      3. 逐次增加等待时间
+    """
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json,text/plain,*/*",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            r = S.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=(15, 45),
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_error = e
+            print(f"requests 第 {attempt}/{attempts} 次失败: {e}")
+
+        # GitHub Actions 上 curl 有时比 Python requests 更稳定
+        try:
+            query_url = requests.Request(
+                "GET", url, params=params
+            ).prepare().url
+
+            cmd = [
+                "curl",
+                "-L",
+                "--retry", "2",
+                "--retry-delay", "2",
+                "--connect-timeout", "15",
+                "--max-time", "60",
+                "-sS",
+                "-A", UA,
+                "-H", f"Referer: {referer or url}",
+                query_url,
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=75,
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+
+            if result.stderr:
+                print("curl 失败:", result.stderr.strip())
+        except Exception as e:
+            last_error = e
+            print("curl 备用请求失败:", e)
+
+        if attempt < attempts:
+            wait = attempt * 3
+            print(f"{wait} 秒后重试...")
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"数据接口连续 {attempts} 次请求失败: {url}; "
+        f"最后错误: {last_error}"
+    )
+
+
 def get_eastmoney_index():
     """沪深300日线：东方财富公开接口，无 Token。"""
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
     params = {
         "secid": "1.000300",
         "fields1": "f1,f2,f3",
@@ -38,114 +119,161 @@ def get_eastmoney_index():
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
     }
 
-    r = S.get(
+    j = get_json_with_retry(
         url,
         params=params,
-        headers={"Referer": "https://quote.eastmoney.com/"},
-        timeout=30,
+        referer="https://quote.eastmoney.com/",
     )
-    r.raise_for_status()
 
-    j = r.json()
     ks = (j.get("data") or {}).get("klines") or []
 
     if not ks:
         raise RuntimeError("东方财富沪深300历史行情为空")
 
     rows = []
+
     for k in ks:
         x = k.split(",")
         if len(x) < 3:
             continue
-        rows.append({
-            "date": x[0],
-            "index": float(x[2]),
-        })
+
+        try:
+            rows.append({
+                "date": x[0],
+                "index": float(x[2]),
+            })
+        except (TypeError, ValueError):
+            pass
 
     df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df = df.dropna(subset=["date", "index"])
 
     if df.empty:
         raise RuntimeError("东方财富沪深300数据解析为空")
 
-    return df[["date", "index"]]
+    df["date"] = pd.to_datetime(
+        df["date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    df = df.dropna(subset=["date", "index"])
+
+    if df.empty:
+        raise RuntimeError("东方财富沪深300日期解析为空")
+
+    return df[["date", "index"]].drop_duplicates("date")
 
 
 def get_csindex_dividend():
     """
-    沪深300历史股息率：中证指数公开估值文件。
+    沪深300历史股息率：中证指数公开估值 XLS。
 
-    注意：
-    这个 XLS 的日期是 YYYYMMDD 数字。
-    之前代码直接 pd.to_datetime() 会把它错误解析成 1970 年，
-    导致 GitHub Actions 只得到类似 1970-01-01 的日期。
+    中证文件中的日期是 YYYYMMDD。
+    必须按 %Y%m%d 解析，不能直接 pd.to_datetime()，
+    否则会被误解析成 1970 年附近。
     """
     url = (
         "https://oss-ch.csindex.com.cn/static/html/csindex/"
         "public/uploads/file/autofile/indicator/000300indicator.xls"
     )
 
-    r = S.get(url, timeout=60)
-    r.raise_for_status()
+    last_error = None
 
-    content_type = (r.headers.get("Content-Type") or "").lower()
-    if len(r.content) < 1000:
-        raise RuntimeError(
-            f"中证指数估值文件异常，文件大小只有 {len(r.content)} bytes"
-        )
+    for attempt in range(1, 6):
+        try:
+            r = S.get(
+                url,
+                headers={
+                    "User-Agent": UA,
+                    "Referer": "https://www.csindex.com.cn/",
+                },
+                timeout=(20, 60),
+            )
+            r.raise_for_status()
 
-    df = pd.read_excel(
-        io.BytesIO(r.content),
-        engine="xlrd",
+            if len(r.content) < 1000:
+                raise RuntimeError(
+                    f"文件太小: {len(r.content)} bytes"
+                )
+
+            df = pd.read_excel(
+                io.BytesIO(r.content),
+                engine="xlrd",
+            )
+
+            if len(df.columns) < 10:
+                raise RuntimeError("估值文件字段少于10列")
+
+            df = df.iloc[:, :10].copy()
+
+            df.columns = [
+                "date",
+                "code",
+                "name_cn",
+                "name_short",
+                "name_en",
+                "short_en",
+                "pe1",
+                "pe2",
+                "dividend1",
+                "dividend2",
+            ]
+
+            df["date"] = pd.to_datetime(
+                df["date"]
+                .astype(str)
+                .str.replace(r"\.0$", "", regex=True),
+                format="%Y%m%d",
+                errors="coerce",
+            ).dt.strftime("%Y-%m-%d")
+
+            df["dividend1"] = pd.to_numeric(
+                df["dividend1"], errors="coerce"
+            )
+
+            df = df.dropna(
+                subset=["date", "dividend1"]
+            )
+
+            df = df[
+                (df["date"] >= "2008-01-01")
+                & (df["date"] <= date.today().strftime("%Y-%m-%d"))
+            ]
+
+            if df.empty:
+                raise RuntimeError(
+                    "中证指数没有返回有效的2008年以后股息率"
+                )
+
+            # 文件单位：百分比。
+            # 例如 2.79 -> 0.0279
+            df["dividend_yield"] = df["dividend1"] / 100.0
+
+            return (
+                df[["date", "dividend_yield"]]
+                .drop_duplicates("date")
+                .sort_values("date")
+            )
+
+        except Exception as e:
+            last_error = e
+            print(
+                f"中证指数第 {attempt}/5 次失败: {e}"
+            )
+            if attempt < 5:
+                time.sleep(attempt * 3)
+
+    raise RuntimeError(
+        f"中证指数估值文件连续请求失败: {last_error}"
     )
-
-    if len(df.columns) < 10:
-        raise RuntimeError("中证指数估值文件字段异常")
-
-    df = df.iloc[:, :10].copy()
-    df.columns = [
-        "date",
-        "code",
-        "name_cn",
-        "name_short",
-        "name_en",
-        "short_en",
-        "pe1",
-        "pe2",
-        "dividend1",
-        "dividend2",
-    ]
-
-    # 关键修复：中证文件日期格式为 YYYYMMDD
-    df["date"] = pd.to_datetime(
-        df["date"].astype(str).str.replace(r"\.0$", "", regex=True),
-        format="%Y%m%d",
-        errors="coerce",
-    ).dt.strftime("%Y-%m-%d")
-
-    df["dividend1"] = pd.to_numeric(
-        df["dividend1"], errors="coerce"
-    )
-
-    df = df.dropna(subset=["date", "dividend1"])
-    df = df[df["date"] >= "2008-01-01"]
-
-    if df.empty:
-        raise RuntimeError("中证指数没有返回有效的沪深300股息率历史数据")
-
-    # dividend1 的单位是百分比，例如 2.79 -> 0.0279
-    df["dividend_yield"] = df["dividend1"] / 100.0
-
-    return df[["date", "dividend_yield"]].drop_duplicates("date")
 
 
 def get_bond():
     """
-    中国10年期国债到期收益率：东方财富公开宏观数据接口，无 Token。
+    中国10年期国债到期收益率：
+    东方财富公开宏观数据接口，无 Token。
 
     EMM00166466 = 10年期国债到期收益率。
-    例如 2026-09-11 返回 1.6899，代表 1.6899%。
+    原始单位为百分比，例如 1.6899。
+    输出转换为小数 0.016899。
     """
     url = "https://datacenter-web.eastmoney.com/api/data/get"
 
@@ -153,7 +281,7 @@ def get_bond():
     page = 1
     page_size = 500
 
-    while True:
+    while page <= 30:
         params = {
             "type": "RPTA_WEB_TREASURYYIELD",
             "sty": "ALL",
@@ -163,15 +291,12 @@ def get_bond():
             "ps": page_size,
         }
 
-        r = S.get(
+        j = get_json_with_retry(
             url,
             params=params,
-            headers={"Referer": "https://data.eastmoney.com/cjsj/zmgzsyl.html"},
-            timeout=45,
+            referer="https://data.eastmoney.com/cjsj/zmgzsyl.html",
         )
-        r.raise_for_status()
 
-        j = r.json()
         result = j.get("result") or {}
         data = result.get("data") or []
 
@@ -193,59 +318,61 @@ def get_bond():
 
         pages = int(result.get("pages") or page)
 
+        oldest = min(
+            (x["date"] for x in rows),
+            default="9999-12-31",
+        )
+
+        if oldest < "2008-01-01":
+            break
+
         if page >= pages:
             break
 
         page += 1
 
-        # 数据按日期倒序。
-        # 如果已经早于 2008 年，则没有必要继续翻页。
-        oldest = min(
-            (r["date"] for r in rows),
-            default="9999-12-31",
-        )
-        if oldest < "2008-01-01":
-            break
-
-        if page > 30:
-            # 防止接口异常时无限循环
-            break
-
     df = pd.DataFrame(rows)
 
     if df.empty:
-        raise RuntimeError("东方财富没有返回中国10年期国债数据")
+        raise RuntimeError(
+            "东方财富没有返回中国10年期国债数据"
+        )
 
     df = df.drop_duplicates("date")
     df = df[df["date"] >= "2008-01-01"]
     df = df.sort_values("date")
 
     if df.empty:
-        raise RuntimeError("东方财富10年期国债数据没有2008年以后的记录")
+        raise RuntimeError(
+            "10年期国债数据没有2008年以后的记录"
+        )
 
     return df[["date", "bond_yield"]]
 
 
 def main():
-    print("1/3 获取东方财富沪深300...")
+    print("1/3 获取沪深300指数...")
     idx = get_eastmoney_index()
     print(
+        "指数:",
         len(idx),
         idx["date"].min(),
         idx["date"].max(),
     )
 
-    print("2/3 获取中证指数沪深300股息率...")
+    print("2/3 获取沪深300股息率...")
     div = get_csindex_dividend()
     print(
+        "股息率:",
         len(div),
         div["date"].min(),
         div["date"].max(),
     )
 
-    print("3/3 获取东方财富10年期国债收益率...")
+    print("3/3 获取中国10年期国债收益率...")
     bond = get_bond()
     print(
+        "国债:",
         len(bond),
         bond["date"].min(),
         bond["date"].max(),
@@ -264,17 +391,21 @@ def main():
             "拒绝生成不完整数据文件"
         )
 
-    df["spread"] = df["dividend_yield"] - df["bond_yield"]
+    df["spread"] = (
+        df["dividend_yield"] - df["bond_yield"]
+    )
 
     df = (
         df.replace([math.inf, -math.inf], pd.NA)
-        .dropna(subset=[
-            "date",
-            "index",
-            "dividend_yield",
-            "bond_yield",
-            "spread",
-        ])
+        .dropna(
+            subset=[
+                "date",
+                "index",
+                "dividend_yield",
+                "bond_yield",
+                "spread",
+            ]
+        )
     )
 
     data = []
@@ -283,10 +414,21 @@ def main():
         data.append({
             "date": r["date"],
             "index": round(float(r["index"]), 4),
-            "dividend_yield": round(float(r["dividend_yield"]), 8),
-            "bond_yield": round(float(r["bond_yield"]), 8),
-            "spread": round(float(r["spread"]), 8),
+            "dividend_yield": round(
+                float(r["dividend_yield"]), 8
+            ),
+            "bond_yield": round(
+                float(r["bond_yield"]), 8
+            ),
+            "spread": round(
+                float(r["spread"]), 8
+            ),
         })
+
+    if not data:
+        raise RuntimeError(
+            "最终没有可用数据，停止生成 market.json"
+        )
 
     payload = {
         "updated_at": pd.Timestamp.utcnow().isoformat(),
@@ -298,11 +440,18 @@ def main():
         "data": data,
     }
 
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    os.makedirs(
+        os.path.dirname(OUT),
+        exist_ok=True,
+    )
 
     tmp = OUT + ".tmp"
 
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(
+        tmp,
+        "w",
+        encoding="utf-8",
+    ) as f:
         json.dump(
             payload,
             f,
@@ -316,9 +465,10 @@ def main():
 
     print("")
     print("========================================")
-    print("写入成功:", OUT)
-    print("records =", len(data))
-    print("latest  =", latest)
+    print("数据更新成功")
+    print("文件:", OUT)
+    print("记录数:", len(data))
+    print("最新数据:", latest)
     print("========================================")
 
 
