@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>股债利差</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#20252b;font-family:"Microsoft YaHei","PingFang SC","Noto Sans SC",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.page{width:min(1380px,calc(100% - 64px));margin:28px auto 40px;background:#fff;border:1px solid #e5e8ed;border-radius:8px;box-shadow:0 2px 12px rgba(20,30,45,.05);overflow:hidden}
+.header{padding:20px 28px 12px;border-bottom:1px solid #edf0f3}.title{font-size:22px;font-weight:700;margin-bottom:14px}.tabs,.subtabs{display:flex;gap:8px;flex-wrap:wrap}.tab{border:1px solid #d9dee5;background:#fff;color:#5b6470;border-radius:4px;padding:7px 14px;font-size:13px;cursor:pointer}.tab.active{color:#1677ff;border-color:#1677ff;background:#f3f8ff}.toolbar{display:flex;align-items:center;gap:18px;padding:14px 28px;border-bottom:1px solid #edf0f3;flex-wrap:wrap}.label{font-size:13px;color:#66717e}.select{height:32px;border:1px solid #cfd6de;border-radius:4px;padding:0 28px 0 10px;background:#fff;font-size:13px;color:#333}.chart-wrap{padding:14px 20px 0}.chart{height:510px;width:100%}.frequency{display:flex;gap:18px;padding:0 28px 18px;font-size:13px;color:#5f6975}.frequency label{cursor:pointer}.status{margin:0 28px 14px;padding:10px 12px;border-radius:4px;background:#fff7e6;color:#8a5a00;border:1px solid #ffe1a6;font-size:13px;display:none}.section{padding:18px 28px;border-top:1px solid #edf0f3}.section h3{font-size:15px;margin:0 0 12px}.table{width:100%;border-collapse:collapse;font-size:13px}.table th,.table td{border-bottom:1px solid #edf0f3;padding:9px 10px;text-align:right}.table th:first-child,.table td:first-child{text-align:left}.table th{background:#fafbfc;color:#687381;font-weight:500}.note{font-size:12px;line-height:1.8;color:#7a838e}.source{font-size:12px;color:#8a929c;margin-top:8px}.source a{color:#64748b;text-decoration:none}.footer{padding:16px 28px;color:#9aa2ac;font-size:11px;border-top:1px solid #edf0f3}
+@media(max-width:800px){.page{width:calc(100% - 24px);margin:12px auto}.header,.toolbar,.section,.frequency{padding-left:16px;padding-right:16px}.chart{height:430px}.chart-wrap{padding-left:8px;padding-right:8px}}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <div class="title">股债利差</div>
+    <div class="tabs"><button class="tab active">沪深300</button><button class="tab">沪深300(非金融)</button><button class="tab">上证50</button><button class="tab">中证500</button></div>
+  </div>
+  <div class="toolbar">
+    <div class="subtabs"><button class="tab active">1/市盈率</button><button class="tab">等权股息率TTM</button><button class="tab">静态股息率</button></div>
+    <span class="label">均线</span>
+    <select id="ma" class="select"><option value="1">1年</option><option value="2">2年</option><option value="2.5" selected>2.5年</option><option value="3">3年</option><option value="5">5年</option></select>
+  </div>
+  <div id="status" class="status"></div>
+  <div class="chart-wrap"><div id="chart" class="chart"></div></div>
+  <div class="frequency"><label><input type="radio" name="freq" value="daily" checked> 日线</label><label><input type="radio" name="freq" value="monthly"> 月线（月底数据）</label></div>
+  <div class="section"><h3>最新数据</h3><table class="table"><thead><tr><th>日期</th><th>沪深300</th><th>股息率</th><th>10年国债</th><th>股债利差</th></tr></thead><tbody id="latest"></tbody></table></div>
+  <div class="section"><h3>说明</h3><div class="note">股债利差 = 沪深300股息率 − 中国10年期国债收益率。均线为股债利差的滚动均值；上下轨为同窗口滚动标准差的 ±2 倍。网页数据由 GitHub Actions 定期抓取并写入 <code>data/market.json</code>，前端不保存任何 API Token。</div><div class="source">数据源：沪深300行情—<a href="https://quote.eastmoney.com/zs000300.html" target="_blank">东方财富</a>；指数估值/股息率—<a href="https://www.csindex.com.cn/" target="_blank">中证指数</a>；10年期国债收益率—<a href="https://www.chinamoney.org.cn/chinese/sddsintigy/" target="_blank">中国货币网</a>。</div></div>
+  <div class="footer">仅用于数据展示与研究，不构成投资建议。</div>
+</div>
+<script>
+const state={rows:[],ma:2.5,freq:'daily'};const chart=echarts.init(document.getElementById('chart'));
+function showStatus(t){const el=document.getElementById('status');el.textContent=t;el.style.display='block'}
+function hideStatus(){document.getElementById('status').style.display='none'}
+function daysForYears(y){return Math.round(y*250)}
+function monthEnd(rows){const m=new Map();for(const r of rows){const d=r.date.slice(0,7);m.set(d,r)}return [...m.values()]}
+function enrich(rows){const w=daysForYears(state.ma);const out=[];for(let i=0;i<rows.length;i++){const a=rows.slice(Math.max(0,i-w+1),i+1).map(x=>x.spread).filter(Number.isFinite);const avg=a.reduce((s,x)=>s+x,0)/a.length;const sd=Math.sqrt(a.reduce((s,x)=>s+(x-avg)**2,0)/a.length);out.push({...rows[i],ma:avg,upper:avg+2*sd,lower:avg-2*sd})}return out}
+function render(){let rows=state.freq==='monthly'?monthEnd(state.rows):state.rows;if(!rows.length){showStatus('数据读取失败：data/market.json 无法读取或格式不正确，请先运行 GitHub Actions 更新数据。');return}hideStatus();const a=enrich(rows);const dates=a.map(x=>x.date);const opt={animation:false,grid:{left:68,right:68,top:40,bottom:55},tooltip:{trigger:'axis',axisPointer:{type:'cross'},valueFormatter:v=>Number(v).toFixed(4)},legend:{top:6,left:'center',textStyle:{fontSize:12}},xAxis:{type:'category',data:dates,axisLabel:{fontSize:11,color:'#697381',hideOverlap:true},axisLine:{lineStyle:{color:'#cfd5dc'}}},yAxis:[{type:'value',name:'股债利差',nameTextStyle:{fontSize:12},axisLabel:{formatter:v=>(v*100).toFixed(1)+'%',fontSize:11},splitLine:{lineStyle:{color:'#eef1f4'}}},{type:'value',name:'指数',axisLabel:{fontSize:11},splitLine:{show:false}}],series:[{name:'股债利差',type:'line',yAxisIndex:0,data:a.map(x=>x.spread),showSymbol:false,lineStyle:{width:1.5}},{name:'指数',type:'line',yAxisIndex:1,data:a.map(x=>x.index),showSymbol:false,lineStyle:{width:1.2}},{name:'股债利差均线',type:'line',yAxisIndex:0,data:a.map(x=>x.ma),showSymbol:false,lineStyle:{width:1.4}},{name:'股债利差标准差 × 2',type:'line',yAxisIndex:0,data:a.map(x=>x.upper),showSymbol:false,lineStyle:{width:1,type:'dashed'}},{name:'-股债利差标准差 × 2',type:'line',yAxisIndex:0,data:a.map(x=>x.lower),showSymbol:false,lineStyle:{width:1,type:'dashed'}}]};chart.setOption(opt,true);const last=a[a.length-1];document.getElementById('latest').innerHTML=`<tr><td>${last.date}</td><td>${Number(last.index).toFixed(2)}</td><td>${(last.dividend_yield*100).toFixed(2)}%</td><td>${Number(last.bond_yield).toFixed(4)}%</td><td>${(last.spread*100).toFixed(2)}%</td></tr>`}
+async function load(){try{const r=await fetch('./data/market.json',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const j=await r.json();if(!j||!Array.isArray(j.data)||j.data.length<10)throw new Error('empty');state.rows=j.data.map(x=>({date:String(x.date),index:Number(x.index),dividend_yield:Number(x.dividend_yield),bond_yield:Number(x.bond_yield),spread:Number(x.spread)})).filter(x=>x.date&&Number.isFinite(x.index)&&Number.isFinite(x.dividend_yield)&&Number.isFinite(x.bond_yield)&&Number.isFinite(x.spread)).sort((a,b)=>a.date.localeCompare(b.date));render()}catch(e){showStatus('数据读取失败：data/market.json 无法读取或格式不正确，请先运行 GitHub Actions 更新数据。')}}
+document.getElementById('ma').addEventListener('change',e=>{state.ma=Number(e.target.value);render()});document.querySelectorAll('input[name=freq]').forEach(x=>x.addEventListener('change',e=>{state.freq=e.target.value;render()}));window.addEventListener('resize',()=>chart.resize());load();
+</script>
+</body></html>
