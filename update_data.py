@@ -1,211 +1,249 @@
+import io
 import json
 import math
 import os
-import time
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import requests
 
+
 OUT = "data/market.json"
-TOKEN = os.getenv("LIXINGER_TOKEN")
-API_BASE = "https://open.lixinger.com/api"
-START_DATE = "2008-01-01"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/140.0 Safari/537.36"
 )
 
 S = requests.Session()
 S.headers.update({
     "User-Agent": UA,
-    "Content-Type": "application/json",
-    "Accept": "application/json",
+    "Accept": "application/json,text/plain,*/*",
 })
 
 
-def check_token():
-    if not TOKEN:
-        raise RuntimeError(
-            "缺少 LIXINGER_TOKEN。请在 GitHub Settings → "
-            "Secrets and variables → Actions 中添加同名 Secret。"
-        )
+def get_eastmoney_index():
+    """沪深300日线：东方财富公开接口，无 Token。"""
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": "1.000300",
+        "fields1": "f1,f2,f3",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "klt": "101",
+        "fqt": "0",
+        "beg": "20080101",
+        "end": date.today().strftime("%Y%m%d"),
+        "lmt": "6000",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+    }
 
+    r = S.get(
+        url,
+        params=params,
+        headers={"Referer": "https://quote.eastmoney.com/"},
+        timeout=30,
+    )
+    r.raise_for_status()
 
-def daterange_chunks(start="2008-01-01"):
-    """理杏仁单次时间范围不超过10年，因此分段请求。"""
-    start_d = date.fromisoformat(start)
-    end_d = date.today()
+    j = r.json()
+    ks = (j.get("data") or {}).get("klines") or []
 
-    while start_d <= end_d:
-        # 留一点余量，确保不超过10年
-        chunk_end = min(start_d.replace(year=start_d.year + 9) - timedelta(days=1), end_d)
-        yield start_d.isoformat(), chunk_end.isoformat()
-        start_d = chunk_end + timedelta(days=1)
+    if not ks:
+        raise RuntimeError("东方财富沪深300历史行情为空")
 
-
-def lixinger_post(path, payload, retries=3):
-    url = f"{API_BASE}/{path}"
-
-    body = dict(payload)
-    body["token"] = TOKEN
-
-    last_error = None
-
-    for attempt in range(1, retries + 1):
-        try:
-            r = S.post(url, json=body, timeout=60)
-            r.raise_for_status()
-            j = r.json()
-
-            if j.get("code") != 1:
-                raise RuntimeError(
-                    f"理杏仁 API 返回错误: code={j.get('code')}, "
-                    f"message={j.get('message')}"
-                )
-
-            return j.get("data") or []
-
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                wait = attempt * 3
-                print(f"请求失败，第 {attempt} 次重试，等待 {wait}s: {e}")
-                time.sleep(wait)
-
-    raise RuntimeError(f"理杏仁 API 请求失败: {last_error}")
-
-
-def get_index_and_dividend():
-    """
-    一次请求同时获取：
-    - 沪深300收盘点位 cp
-    - 沪深300总市值加权股息率 dyr.mcw
-
-    理杏仁 API 返回的股息率本身为小数：
-    0.0279 = 2.79%
-    """
-    frames = []
-
-    for start, end in daterange_chunks(START_DATE):
-        print(f"  理杏仁指数数据 {start} ~ {end}")
-
-        rows = lixinger_post(
-            "cn/index/fundamental",
-            {
-                "stockCodes": ["000300"],
-                "startDate": start,
-                "endDate": end,
-                "metricsList": ["cp", "dyr.mcw"],
-            },
-        )
-
-        if not rows:
-            print("  本时间段没有返回数据")
+    rows = []
+    for k in ks:
+        x = k.split(",")
+        if len(x) < 3:
             continue
+        rows.append({
+            "date": x[0],
+            "index": float(x[2]),
+        })
 
-        part = []
-        for x in rows:
-            d = x.get("date")
-            cp = x.get("cp")
-            dyr = x.get("dyr.mcw")
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["date", "index"])
 
-            if not d or cp is None or dyr is None:
-                continue
+    if df.empty:
+        raise RuntimeError("东方财富沪深300数据解析为空")
 
-            part.append({
-                "date": str(d)[:10],
-                "index": float(cp),
-                "dividend_yield": float(dyr),
-            })
+    return df[["date", "index"]]
 
-        if part:
-            frames.append(pd.DataFrame(part))
 
-    if not frames:
-        raise RuntimeError("理杏仁没有返回沪深300指数/股息率数据")
+def get_csindex_dividend():
+    """
+    沪深300历史股息率：中证指数公开估值文件。
 
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates("date").sort_values("date")
+    注意：
+    这个 XLS 的日期是 YYYYMMDD 数字。
+    之前代码直接 pd.to_datetime() 会把它错误解析成 1970 年，
+    导致 GitHub Actions 只得到类似 1970-01-01 的日期。
+    """
+    url = (
+        "https://oss-ch.csindex.com.cn/static/html/csindex/"
+        "public/uploads/file/autofile/indicator/000300indicator.xls"
+    )
 
-    # 基本合理性检查：避免异常数据悄悄进入网站
-    if len(df) < 100:
-        raise RuntimeError(f"沪深300指数/股息率有效数据仅 {len(df)} 条")
+    r = S.get(url, timeout=60)
+    r.raise_for_status()
 
-    if not df["index"].between(500, 10000).all():
-        raise RuntimeError("沪深300指数数据存在明显异常值")
+    content_type = (r.headers.get("Content-Type") or "").lower()
+    if len(r.content) < 1000:
+        raise RuntimeError(
+            f"中证指数估值文件异常，文件大小只有 {len(r.content)} bytes"
+        )
 
-    if not df["dividend_yield"].between(0, 0.20).all():
-        raise RuntimeError("沪深300股息率数据存在明显异常值")
+    df = pd.read_excel(
+        io.BytesIO(r.content),
+        engine="xlrd",
+    )
 
-    return df
+    if len(df.columns) < 10:
+        raise RuntimeError("中证指数估值文件字段异常")
+
+    df = df.iloc[:, :10].copy()
+    df.columns = [
+        "date",
+        "code",
+        "name_cn",
+        "name_short",
+        "name_en",
+        "short_en",
+        "pe1",
+        "pe2",
+        "dividend1",
+        "dividend2",
+    ]
+
+    # 关键修复：中证文件日期格式为 YYYYMMDD
+    df["date"] = pd.to_datetime(
+        df["date"].astype(str).str.replace(r"\.0$", "", regex=True),
+        format="%Y%m%d",
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+
+    df["dividend1"] = pd.to_numeric(
+        df["dividend1"], errors="coerce"
+    )
+
+    df = df.dropna(subset=["date", "dividend1"])
+    df = df[df["date"] >= "2008-01-01"]
+
+    if df.empty:
+        raise RuntimeError("中证指数没有返回有效的沪深300股息率历史数据")
+
+    # dividend1 的单位是百分比，例如 2.79 -> 0.0279
+    df["dividend_yield"] = df["dividend1"] / 100.0
+
+    return df[["date", "dividend_yield"]].drop_duplicates("date")
 
 
 def get_bond():
-    """获取中国10年期国债到期收益率。"""
-    frames = []
+    """
+    中国10年期国债到期收益率：东方财富公开宏观数据接口，无 Token。
 
-    for start, end in daterange_chunks(START_DATE):
-        print(f"  理杏仁国债数据 {start} ~ {end}")
+    EMM00166466 = 10年期国债到期收益率。
+    例如 2026-09-11 返回 1.6899，代表 1.6899%。
+    """
+    url = "https://datacenter-web.eastmoney.com/api/data/get"
 
-        rows = lixinger_post(
-            "macro/national-debt",
-            {
-                "areaCode": "cn",
-                "startDate": start,
-                "endDate": end,
-                "metricsList": ["tcm_y10"],
-            },
+    rows = []
+    page = 1
+    page_size = 500
+
+    while True:
+        params = {
+            "type": "RPTA_WEB_TREASURYYIELD",
+            "sty": "ALL",
+            "st": "SOLAR_DATE",
+            "sr": "-1",
+            "p": page,
+            "ps": page_size,
+        }
+
+        r = S.get(
+            url,
+            params=params,
+            headers={"Referer": "https://data.eastmoney.com/cjsj/zmgzsyl.html"},
+            timeout=45,
         )
+        r.raise_for_status()
 
-        if not rows:
-            print("  本时间段没有返回数据")
-            continue
+        j = r.json()
+        result = j.get("result") or {}
+        data = result.get("data") or []
 
-        part = []
-        for x in rows:
-            d = x.get("date")
-            y = x.get("tcm_y10")
+        if not data:
+            break
 
-            if not d or y is None:
-                continue
+        for x in data:
+            d = x.get("SOLAR_DATE")
+            y = x.get("EMM00166466")
 
-            part.append({
-                "date": str(d)[:10],
-                "bond_yield": float(y),
-            })
+            if d and y not in (None, ""):
+                try:
+                    rows.append({
+                        "date": str(d)[:10],
+                        "bond_yield": float(y) / 100.0,
+                    })
+                except (TypeError, ValueError):
+                    pass
 
-        if part:
-            frames.append(pd.DataFrame(part))
+        pages = int(result.get("pages") or page)
 
-    if not frames:
-        raise RuntimeError("理杏仁没有返回中国10年期国债收益率数据")
+        if page >= pages:
+            break
 
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates("date").sort_values("date")
+        page += 1
 
-    if len(df) < 100:
-        raise RuntimeError(f"中国10年期国债有效数据仅 {len(df)} 条")
+        # 数据按日期倒序。
+        # 如果已经早于 2008 年，则没有必要继续翻页。
+        oldest = min(
+            (r["date"] for r in rows),
+            default="9999-12-31",
+        )
+        if oldest < "2008-01-01":
+            break
 
-    if not df["bond_yield"].between(0, 0.20).all():
-        raise RuntimeError("中国10年期国债收益率数据存在明显异常值")
+        if page > 30:
+            # 防止接口异常时无限循环
+            break
 
-    return df
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise RuntimeError("东方财富没有返回中国10年期国债数据")
+
+    df = df.drop_duplicates("date")
+    df = df[df["date"] >= "2008-01-01"]
+    df = df.sort_values("date")
+
+    if df.empty:
+        raise RuntimeError("东方财富10年期国债数据没有2008年以后的记录")
+
+    return df[["date", "bond_yield"]]
 
 
 def main():
-    check_token()
-
-    print("1/2 获取理杏仁沪深300指数 + 总市值加权股息率...")
-    market = get_index_and_dividend()
+    print("1/3 获取东方财富沪深300...")
+    idx = get_eastmoney_index()
     print(
-        len(market),
-        market["date"].min(),
-        market["date"].max(),
+        len(idx),
+        idx["date"].min(),
+        idx["date"].max(),
     )
 
-    print("2/2 获取理杏仁中国10年期国债收益率...")
+    print("2/3 获取中证指数沪深300股息率...")
+    div = get_csindex_dividend()
+    print(
+        len(div),
+        div["date"].min(),
+        div["date"].max(),
+    )
+
+    print("3/3 获取东方财富10年期国债收益率...")
     bond = get_bond()
     print(
         len(bond),
@@ -214,14 +252,16 @@ def main():
     )
 
     df = (
-        market
+        idx
+        .merge(div, on="date", how="inner")
         .merge(bond, on="date", how="inner")
         .sort_values("date")
     )
 
     if len(df) < 100:
         raise RuntimeError(
-            f"三类数据有效重合日期仅 {len(df)} 条，拒绝生成不完整数据文件"
+            f"三类数据有效重合日期仅 {len(df)} 条，"
+            "拒绝生成不完整数据文件"
         )
 
     df["spread"] = df["dividend_yield"] - df["bond_yield"]
@@ -238,6 +278,7 @@ def main():
     )
 
     data = []
+
     for _, r in df.iterrows():
         data.append({
             "date": r["date"],
@@ -248,16 +289,17 @@ def main():
         })
 
     payload = {
-        "updated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
         "source": {
-            "index": "Lixinger",
-            "dividend": "Lixinger",
-            "bond": "Lixinger",
+            "index": "Eastmoney",
+            "dividend": "CSI Index",
+            "bond": "Eastmoney",
         },
         "data": data,
     }
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
+
     tmp = OUT + ".tmp"
 
     with open(tmp, "w", encoding="utf-8") as f:
@@ -271,16 +313,13 @@ def main():
     os.replace(tmp, OUT)
 
     latest = data[-1]
+
+    print("")
+    print("========================================")
     print("写入成功:", OUT)
     print("records =", len(data))
-    print(
-        "latest =",
-        latest["date"],
-        "index =", latest["index"],
-        "dividend =", latest["dividend_yield"],
-        "bond =", latest["bond_yield"],
-        "spread =", latest["spread"],
-    )
+    print("latest  =", latest)
+    print("========================================")
 
 
 if __name__ == "__main__":
