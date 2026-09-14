@@ -95,54 +95,93 @@ def request_with_retry(url, params=None, referer=None, attempts=5):
 
 
 def get_eastmoney_index():
-    """沪深300日线，东方财富公开接口，无 Token。"""
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    """沪深300日线，东方财富公开接口，无 Token。
+
+    GitHub Actions 有时会被 push2his.eastmoney.com 直接断开连接，
+    因此这里准备多个东方财富历史行情节点作为备用。
+    """
+    urls = [
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        "https://61.push2his.eastmoney.com/api/qt/stock/kline/get",
+        "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
+    ]
 
     params = {
         "secid": "1.000300",
-        "fields1": "f1,f2,f3",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         "klt": "101",
         "fqt": "0",
         "beg": "20080101",
         "end": date.today().strftime("%Y%m%d"),
         "lmt": "6000",
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "rtntype": "6",
+        "_": str(int(time.time() * 1000)),
     }
 
-    r = request_with_retry(
-        url,
-        params=params,
-        referer="https://quote.eastmoney.com/",
+    last_error = None
+
+    for url in urls:
+        print(f"尝试东方财富历史行情节点: {url}")
+        try:
+            r = request_with_retry(
+                url,
+                params=params,
+                referer="https://quote.eastmoney.com/",
+                attempts=3,
+            )
+
+            j = json.loads(r.text)
+            ks = (j.get("data") or {}).get("klines") or []
+
+            if not ks:
+                last_error = RuntimeError("返回的 klines 为空")
+                print("该节点没有返回历史行情，尝试下一个节点...")
+                continue
+
+            rows = []
+            for k in ks:
+                x = k.split(",")
+                if len(x) >= 3:
+                    try:
+                        rows.append({
+                            "date": x[0],
+                            "index": float(x[2]),
+                        })
+                    except (ValueError, TypeError):
+                        pass
+
+            df = pd.DataFrame(rows)
+            if df.empty:
+                last_error = RuntimeError("无法解析沪深300历史行情")
+                continue
+
+            df["date"] = pd.to_datetime(
+                df["date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            df = df.dropna(subset=["date", "index"])
+            df = df.drop_duplicates("date").sort_values("date")
+
+            if len(df) < 1000:
+                last_error = RuntimeError(
+                    f"沪深300历史行情只有 {len(df)} 条"
+                )
+                print(f"该节点数据不足：{len(df)} 条，尝试下一个节点...")
+                continue
+
+            print(f"东方财富历史行情节点成功：{len(df)} 条")
+            return df[["date", "index"]]
+
+        except Exception as e:
+            last_error = e
+            print(f"该节点失败: {e}")
+            print("尝试下一个东方财富历史行情节点...")
+
+    raise RuntimeError(
+        "东方财富所有历史行情节点均无法访问。"
+        f"最后错误: {last_error}"
     )
-
-    j = json.loads(r.text)
-    ks = (j.get("data") or {}).get("klines") or []
-
-    if not ks:
-        raise RuntimeError("沪深300历史行情为空")
-
-    rows = []
-
-    for k in ks:
-        x = k.split(",")
-        if len(x) >= 3:
-            try:
-                rows.append({
-                    "date": x[0],
-                    "index": float(x[2]),
-                })
-            except ValueError:
-                pass
-
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(
-        df["date"], errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
-
-    df = df.dropna(subset=["date", "index"])
-
-    return df[["date", "index"]].drop_duplicates("date")
 
 
 def get_legu_pe():
