@@ -148,120 +148,124 @@ def get_eastmoney_index():
 def get_legu_pe():
     """
     乐咕乐股沪深300历史PE。
-
     不需要 Token。
-    这个数据源提供沪深300长期PE序列。
     """
-    url = "https://legulegu.com/stockdata/sz50-ttm-lyr"
+    from io import StringIO
+
+    # 注意：sz50 是上证50；沪深300对应 hs300。
+    url = "https://legulegu.com/stockdata/hs300-ttm-lyr"
 
     r = request_with_retry(
         url,
         referer="https://legulegu.com/",
     )
-
     html = r.text
 
-    # 页面中的历史数据通常以 JSON/JS 对象形式存在。
-    # 优先寻找包含日期和滚动市盈率的 JSON 数组。
-    candidates = []
-
-    patterns = [
-        r'\[\s*\{[^]]{100,}\}\s*\]',
-        r'"data"\s*:\s*(\[[^\]]+\])',
-        r'"list"\s*:\s*(\[[^\]]+\])',
-    ]
-
-    for pattern in patterns:
-        for m in re.finditer(pattern, html, re.S):
-            text = m.group(1) if m.lastindex else m.group(0)
-            if "滚动市盈率" in text or "pe" in text.lower():
-                candidates.append(text)
+    if not html or "<html" not in html.lower():
+        raise RuntimeError("乐咕乐股沪深300页面返回内容异常")
 
     rows = []
 
-    for text in candidates:
-        date_matches = re.findall(
-            r'(20\d{2}-\d{2}-\d{2})',
-            text
-        )
+    # 先尝试页面中的 JSON/JS 数据。
+    patterns = [
+        r'"data"\s*:\s*(\[[\s\S]*?\])',
+        r'"list"\s*:\s*(\[[\s\S]*?\])',
+    ]
 
-        # 尝试解析标准 JSON
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, list):
-                for x in obj:
-                    if not isinstance(x, dict):
-                        continue
+    for pattern in patterns:
+        for m in re.finditer(pattern, html, re.I):
+            candidate = m.group(1)
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
 
-                    d = (
-                        x.get("date")
-                        or x.get("日期")
-                        or x.get("Date")
-                    )
+            if not isinstance(obj, list):
+                continue
 
-                    pe = (
-                        x.get("pe")
-                        or x.get("pe_ttm")
-                        or x.get("滚动市盈率")
-                        or x.get("市盈率")
-                    )
+            for x in obj:
+                if not isinstance(x, dict):
+                    continue
 
-                    if d and pe not in (None, ""):
-                        try:
-                            rows.append({
-                                "date": str(d)[:10],
-                                "pe": float(pe),
-                            })
-                        except (TypeError, ValueError):
-                            pass
-        except Exception:
-            pass
+                d = (
+                    x.get("date") or x.get("日期") or
+                    x.get("Date") or x.get("trade_date")
+                )
+                pe = (
+                    x.get("pe") or x.get("pe_ttm") or
+                    x.get("滚动市盈率") or x.get("市盈率") or
+                    x.get("PE") or x.get("PE_TTM")
+                )
 
-    # 如果页面结构发生变化，尝试直接读取 HTML 表格。
+                if d is None or pe in (None, ""):
+                    continue
+
+                try:
+                    value = float(str(pe).replace(",", "").strip())
+                    if value > 0:
+                        rows.append({
+                            "date": str(d)[:10],
+                            "pe": value,
+                        })
+                except (TypeError, ValueError):
+                    pass
+
+    # 如果 JSON 没有直接提供历史序列，再解析页面中的 HTML 表格。
     if not rows:
         try:
-            tables = pd.read_html(html)
-
-            for table in tables:
-                cols = [str(c) for c in table.columns]
-
-                date_col = next(
-                    (
-                        c for c in table.columns
-                        if "日期" in str(c)
-                        or "date" in str(c).lower()
-                    ),
-                    None,
-                )
-
-                pe_col = next(
-                    (
-                        c for c in table.columns
-                        if "滚动市盈率" in str(c)
-                        or "市盈率" in str(c)
-                        or "pe" in str(c).lower()
-                    ),
-                    None,
-                )
-
-                if date_col is not None and pe_col is not None:
-                    for _, x in table.iterrows():
-                        d = pd.to_datetime(
-                            x[date_col],
-                            errors="coerce",
-                        )
-                        try:
-                            pe = float(x[pe_col])
-                        except (TypeError, ValueError):
-                            continue
-
-                        if pd.notna(d) and math.isfinite(pe) and pe > 0:
-                            rows.append({
-                                "date": d.strftime("%Y-%m-%d"),
-                                "pe": pe,
-                            })
+            # 使用 StringIO，避免 pandas 把 HTML 字符串误认为本地文件名。
+            tables = pd.read_html(StringIO(html))
         except Exception as e:
-            print("解析乐咕乐股表格失败:", e)
+            print("解析乐咕乐股HTML表格失败:", e)
+            tables = []
+
+        for table in tables:
+            if table.empty:
+                continue
+
+            date_col = None
+            pe_col = None
+
+            for c in table.columns:
+                name = str(c).strip()
+                low = name.lower()
+
+                if date_col is None and (
+                    "日期" in name or
+                    "date" in low or
+                    "交易日" in name
+                ):
+                    date_col = c
+
+                if pe_col is None and (
+                    "滚动市盈率" in name or
+                    "市盈率" in name or
+                    low in {"pe", "pe_ttm", "ttm pe"} or
+                    "ttm" in low
+                ):
+                    pe_col = c
+
+            if date_col is None or pe_col is None:
+                continue
+
+            for _, x in table.iterrows():
+                d = pd.to_datetime(
+                    x[date_col],
+                    errors="coerce",
+                )
+
+                try:
+                    value = float(
+                        str(x[pe_col]).replace(",", "").strip()
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+                if pd.notna(d) and math.isfinite(value) and value > 0:
+                    rows.append({
+                        "date": d.strftime("%Y-%m-%d"),
+                        "pe": value,
+                    })
 
     df = pd.DataFrame(rows)
 
