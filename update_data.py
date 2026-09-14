@@ -1,10 +1,10 @@
 import json
 import math
 import os
-import re
 import subprocess
 import time
 from datetime import date
+from io import StringIO
 
 import pandas as pd
 import requests
@@ -79,15 +79,13 @@ def request_with_retry(url, params=None, referer=None, attempts=5):
                     content = result.stdout.encode("utf-8")
                 return CurlResponse()
 
-            if result.stderr:
-                print("curl 失败:", result.stderr.strip())
+            if result.stderr.strip():
+                print(f"curl 失败: {result.stderr.strip()}")
 
         except Exception as e:
-            last_error = e
-            print("curl 备用请求失败:", e)
+            print(f"curl 异常: {e}")
 
-        if attempt < attempts:
-            time.sleep(attempt * 3)
+        time.sleep(attempt * 3)
 
     raise RuntimeError(
         f"请求失败: {url}; 最后错误: {last_error}"
@@ -98,7 +96,7 @@ def get_eastmoney_index():
     """沪深300日线，东方财富公开接口，无 Token。
 
     GitHub Actions 有时会被 push2his.eastmoney.com 直接断开连接，
-    因此这里准备多个东方财富历史行情节点作为备用。
+    因此准备多个东方财富历史行情节点作为备用。
     """
     urls = [
         "https://push2his.eastmoney.com/api/qt/stock/kline/get",
@@ -170,7 +168,13 @@ def get_eastmoney_index():
                 print(f"该节点数据不足：{len(df)} 条，尝试下一个节点...")
                 continue
 
-            print(f"东方财富历史行情节点成功：{len(df)} 条")
+            print(
+                f"东方财富历史行情节点成功：{len(df)} 条"
+            )
+            print(
+                f"指数: {len(df)} "
+                f"{df['date'].iloc[0]} {df['date'].iloc[-1]}"
+            )
             return df[["date", "index"]]
 
         except Exception as e:
@@ -186,159 +190,148 @@ def get_eastmoney_index():
 
 def get_legu_pe():
     """
-    乐咕乐股沪深300历史PE。
-    不需要 Token。
+    使用 AKShare 的 stock_index_pe_lg() 获取乐咕乐股沪深300历史 PE。
+
+    这是无 Token 方案。
+    AKShare 官方接口名称为 stock_index_pe_lg，
+    symbol 使用中文“沪深300”。
+
+    返回：
+        date: YYYY-MM-DD
+        pe: 滚动市盈率（TTM）
     """
-    from io import StringIO
+    try:
+        import akshare as ak
+    except ImportError as e:
+        raise RuntimeError(
+            "未安装 AKShare。请确认 requirements.txt 已加入 akshare。"
+        ) from e
 
-    # 注意：sz50 是上证50；沪深300对应 hs300。
-    url = "https://legulegu.com/stockdata/hs300-ttm-lyr"
+    last_error = None
 
-    r = request_with_retry(
-        url,
-        referer="https://legulegu.com/",
-    )
-    html = r.text
-
-    if not html or "<html" not in html.lower():
-        raise RuntimeError("乐咕乐股沪深300页面返回内容异常")
-
-    rows = []
-
-    # 先尝试页面中的 JSON/JS 数据。
-    patterns = [
-        r'"data"\s*:\s*(\[[\s\S]*?\])',
-        r'"list"\s*:\s*(\[[\s\S]*?\])',
-    ]
-
-    for pattern in patterns:
-        for m in re.finditer(pattern, html, re.I):
-            candidate = m.group(1)
-            try:
-                obj = json.loads(candidate)
-            except Exception:
-                continue
-
-            if not isinstance(obj, list):
-                continue
-
-            for x in obj:
-                if not isinstance(x, dict):
-                    continue
-
-                d = (
-                    x.get("date") or x.get("日期") or
-                    x.get("Date") or x.get("trade_date")
-                )
-                pe = (
-                    x.get("pe") or x.get("pe_ttm") or
-                    x.get("滚动市盈率") or x.get("市盈率") or
-                    x.get("PE") or x.get("PE_TTM")
-                )
-
-                if d is None or pe in (None, ""):
-                    continue
-
-                try:
-                    value = float(str(pe).replace(",", "").strip())
-                    if value > 0:
-                        rows.append({
-                            "date": str(d)[:10],
-                            "pe": value,
-                        })
-                except (TypeError, ValueError):
-                    pass
-
-    # 如果 JSON 没有直接提供历史序列，再解析页面中的 HTML 表格。
-    if not rows:
+    for attempt in range(1, 4):
         try:
-            # 使用 StringIO，避免 pandas 把 HTML 字符串误认为本地文件名。
-            tables = pd.read_html(StringIO(html))
-        except Exception as e:
-            print("解析乐咕乐股HTML表格失败:", e)
-            tables = []
+            print(
+                f"调用 AKShare stock_index_pe_lg('沪深300') "
+                f"第 {attempt}/3 次..."
+            )
 
-        for table in tables:
-            if table.empty:
-                continue
+            df = ak.stock_index_pe_lg(symbol="沪深300")
 
+            if df is None or df.empty:
+                raise RuntimeError("AKShare 返回空数据")
+
+            print(f"AKShare 返回 {len(df)} 条 PE 数据")
+            print("PE 字段:", list(df.columns))
+
+            # AKShare 当前接口通常返回：
+            # 日期、指数、等权静态市盈率、静态市盈率、
+            # 静态市盈率中位数、等权滚动市盈率、滚动市盈率、
+            # 滚动市盈率中位数
             date_col = None
+            for col in df.columns:
+                name = str(col).strip()
+                if name == "日期" or name.lower() == "date":
+                    date_col = col
+                    break
+
+            if date_col is None:
+                # 兼容未来版本可能返回英文日期字段
+                for col in df.columns:
+                    if "日期" in str(col) or "date" in str(col).lower():
+                        date_col = col
+                        break
+
             pe_col = None
 
-            for c in table.columns:
-                name = str(c).strip()
-                low = name.lower()
+            # 优先使用滚动市盈率（TTM），而不是静态市盈率。
+            preferred_names = [
+                "滚动市盈率",
+                "TTM市盈率",
+                "PE-TTM",
+                "pe_ttm",
+            ]
 
-                if date_col is None and (
-                    "日期" in name or
-                    "date" in low or
-                    "交易日" in name
-                ):
-                    date_col = c
+            for wanted in preferred_names:
+                for col in df.columns:
+                    if str(col).strip() == wanted:
+                        pe_col = col
+                        break
+                if pe_col is not None:
+                    break
 
-                if pe_col is None and (
-                    "滚动市盈率" in name or
-                    "市盈率" in name or
-                    low in {"pe", "pe_ttm", "ttm pe"} or
-                    "ttm" in low
-                ):
-                    pe_col = c
+            # 兼容列名变化
+            if pe_col is None:
+                for col in df.columns:
+                    name = str(col).strip().lower()
+                    if (
+                        "滚动市盈率" in str(col)
+                        or "ttm" in name
+                    ):
+                        pe_col = col
+                        break
 
-            if date_col is None or pe_col is None:
-                continue
-
-            for _, x in table.iterrows():
-                d = pd.to_datetime(
-                    x[date_col],
-                    errors="coerce",
+            if date_col is None:
+                raise RuntimeError(
+                    f"AKShare 返回数据中找不到日期字段: {list(df.columns)}"
                 )
 
-                try:
-                    value = float(
-                        str(x[pe_col]).replace(",", "").strip()
-                    )
-                except (TypeError, ValueError):
-                    continue
+            if pe_col is None:
+                raise RuntimeError(
+                    f"AKShare 返回数据中找不到滚动市盈率字段: {list(df.columns)}"
+                )
 
-                if pd.notna(d) and math.isfinite(value) and value > 0:
-                    rows.append({
-                        "date": d.strftime("%Y-%m-%d"),
-                        "pe": value,
-                    })
+            out = pd.DataFrame({
+                "date": df[date_col],
+                "pe": df[pe_col],
+            })
 
-    df = pd.DataFrame(rows)
+            # 注意：
+            # 当前 AKShare 某些版本返回的“日期”已经是 datetime/date，
+            # 不要把它当毫秒时间戳再次转换。
+            out["date"] = pd.to_datetime(
+                out["date"], errors="coerce"
+            )
 
-    if df.empty:
-        raise RuntimeError(
-            "无法从乐咕乐股页面取得沪深300历史PE"
-        )
+            out["pe"] = pd.to_numeric(
+                out["pe"], errors="coerce"
+            )
 
-    df["date"] = pd.to_datetime(
-        df["date"], errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
+            out = out.dropna(subset=["date", "pe"])
+            out = out[out["pe"] > 0]
+            out = out[out["date"] >= pd.Timestamp("2008-01-01")]
+            out = out.drop_duplicates("date")
+            out = out.sort_values("date")
 
-    df["pe"] = pd.to_numeric(
-        df["pe"], errors="coerce"
+            out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+
+            if len(out) < 100:
+                raise RuntimeError(
+                    f"AKShare 沪深300历史PE只有 {len(out)} 条，"
+                    "拒绝生成不完整数据"
+                )
+
+            print(
+                f"沪深300历史PE成功：{len(out)} 条 "
+                f"{out['date'].iloc[0]} {out['date'].iloc[-1]}"
+            )
+
+            return out[["date", "pe"]]
+
+        except Exception as e:
+            last_error = e
+            print(f"AKShare 第 {attempt}/3 次失败: {e}")
+            if attempt < 3:
+                time.sleep(attempt * 5)
+
+    raise RuntimeError(
+        "无法通过 AKShare 获取沪深300历史PE。"
+        f"最后错误: {last_error}"
     )
-
-    df = df.dropna(subset=["date", "pe"])
-    df = df[df["pe"] > 0]
-    df = df[df["date"] >= "2008-01-01"]
-    df = df.drop_duplicates("date").sort_values("date")
-
-    if len(df) < 100:
-        raise RuntimeError(
-            f"乐咕乐股沪深300PE只有 {len(df)} 条，"
-            "拒绝生成不完整数据"
-        )
-
-    return df[["date", "pe"]]
 
 
 # 历史公开研究资料中的沪深300年度股息率（%）。
-# 2008-2024 年用于构造无 Token 的长期估算序列。
-# 这些是年度值，因此程序只用它们校准每年的 payout ratio，
-# 再结合每日 PE 得到每日估算股息率。
+# 用于构造无 Token 的长期估算序列。
 HISTORICAL_ANNUAL_DIVIDEND_YIELD = {
     2008: 0.34,
     2009: 1.87,
@@ -382,29 +375,18 @@ HISTORICAL_ANNUAL_PE = {
     2025: 14.31,
 }
 
-# 2026 当前总市值加权股息率约 2.83%。
-# 用当前公开值校准当前 payout ratio。
+# 当前公开的沪深300总市值加权股息率参考值。
 CURRENT_DIVIDEND_YIELD = 2.83
 
 
 def get_dividend_yield(pe_df):
     """
-    无 Token 的长期股息率估算。
+    根据历史年度股息率 + PE 反推 payout ratio，
+    再结合每日沪深300 TTM PE 估算每日股息率。
 
     重要：
-    这是“估算值”，不是理杏仁 API 的逐日原始值。
-    计算思路：
-        earnings_yield = 100 / PE
-        dividend_yield = earnings_yield * payout_ratio
-
-    2008-2024：
-        使用公开年度沪深300股息率和年度平均PE反推年度 payout ratio。
-
-    2025：
-        使用 2025 年平均PE，并沿用 2024 年 payout ratio。
-
-    2026：
-        使用当前公开总市值加权股息率 2.83% 反推当前 payout ratio。
+    这里的 dividend_yield 是“无 Token 历史估算值”，
+    不是理杏仁 API 的逐日原始股息率。
     """
     ratios = {}
 
@@ -413,9 +395,11 @@ def get_dividend_yield(pe_df):
         if pe and pe > 0:
             ratios[year] = (dy / 100.0) / (1.0 / pe)
 
+    # 2025 沿用 2024 payout ratio
     if 2024 in ratios:
         ratios[2025] = ratios[2024]
 
+    # 2026 用当前参考股息率反推当前 payout ratio
     current_pe = HISTORICAL_ANNUAL_PE.get(2025, 14.31)
     ratios[2026] = (
         (CURRENT_DIVIDEND_YIELD / 100.0)
@@ -423,13 +407,10 @@ def get_dividend_yield(pe_df):
     )
 
     result = pe_df.copy()
-    result["year"] = pd.to_datetime(
-        result["date"]
-    ).dt.year
-
+    result["year"] = pd.to_datetime(result["date"]).dt.year
     result["payout_ratio"] = result["year"].map(ratios)
 
-    # 对于没有历史年度参数的情况，使用最近可用参数。
+    # 对没有对应年度参数的数据，使用最近可用参数。
     result["payout_ratio"] = (
         result["payout_ratio"]
         .ffill()
@@ -441,6 +422,7 @@ def get_dividend_yield(pe_df):
         * result["payout_ratio"]
     )
 
+    # 防止异常值污染网站数据
     result["dividend_yield"] = (
         result["dividend_yield"]
         .clip(lower=0, upper=0.20)
@@ -487,6 +469,8 @@ def get_bond():
                 try:
                     rows.append({
                         "date": str(d)[:10],
+                        # 接口字段是百分数，例如 1.6899，
+                        # 网站 JSON 统一保存为小数 0.016899。
                         "bond_yield": float(y) / 100.0,
                     })
                 except (TypeError, ValueError):
@@ -513,46 +497,38 @@ def get_bond():
     df = df[df["date"] >= "2008-01-01"]
     df = df.sort_values("date")
 
+    print(
+        f"10年期国债收益率成功：{len(df)} 条 "
+        f"{df['date'].iloc[0]} {df['date'].iloc[-1]}"
+    )
+
     return df[["date", "bond_yield"]]
 
 
 def main():
     print("1/3 获取沪深300指数...")
     idx = get_eastmoney_index()
-    print(
-        f"指数: {len(idx)} "
-        f"{idx['date'].min()} {idx['date'].max()}"
-    )
 
+    print("")
     print("2/3 获取沪深300历史PE并估算股息率...")
     pe = get_legu_pe()
-    div = get_dividend_yield(pe)
+    dy = get_dividend_yield(pe)
 
     print(
-        f"股息率: {len(div)} "
-        f"{div['date'].min()} {div['date'].max()}"
+        f"股息率估算成功：{len(dy)} 条 "
+        f"{dy['date'].iloc[0]} {dy['date'].iloc[-1]}"
     )
 
+    print("")
     print("3/3 获取中国10年期国债收益率...")
     bond = get_bond()
-    print(
-        f"国债: {len(bond)} "
-        f"{bond['date'].min()} {bond['date'].max()}"
-    )
 
-    df = (
-        idx
-        .merge(div, on="date", how="inner")
-        .merge(bond, on="date", how="inner")
-        .sort_values("date")
-    )
+    df = idx.merge(dy, on="date", how="inner")
+    df = df.merge(bond, on="date", how="inner")
 
-    if len(df) < 1000:
-        raise RuntimeError(
-            f"三类数据有效重合日期仅 {len(df)} 条，"
-            "拒绝生成不完整数据文件"
-        )
+    df = df.sort_values("date")
 
+    # 股债利差 = 沪深300估算股息率 - 10年期国债收益率
     df["spread"] = (
         df["dividend_yield"] - df["bond_yield"]
     )
@@ -569,6 +545,12 @@ def main():
             ]
         )
     )
+
+    if len(df) < 1000:
+        raise RuntimeError(
+            f"最终合并数据只有 {len(df)} 条，"
+            "不足以生成长期历史数据，停止写入 market.json"
+        )
 
     data = []
 
@@ -591,7 +573,8 @@ def main():
         "updated_at": pd.Timestamp.utcnow().isoformat(),
         "source": {
             "index": "Eastmoney",
-            "dividend": "Legu PE + historical payout-ratio estimate",
+            "pe": "AKShare stock_index_pe_lg / Legu",
+            "dividend": "Historical payout-ratio estimate based on CSI 300 PE",
             "bond": "Eastmoney",
         },
         "data_note": (
@@ -627,7 +610,8 @@ def main():
     print("数据更新成功")
     print("文件:", OUT)
     print("记录数:", len(data))
-    print("最新数据:", data[-1])
+    print("最早:", data[0])
+    print("最新:", data[-1])
     print("========================================")
 
 
